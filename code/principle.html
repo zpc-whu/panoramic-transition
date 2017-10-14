@@ -1,0 +1,499 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <title>动态全景球</title>
+    <meta charset="utf-8">
+    <link rel="stylesheet" href="css/dat-gui-light-theme.css" type="text/css" />
+    
+    <style>
+        body {
+            margin: 0px;
+            overflow: hidden;
+            z-index: -1000;
+        }
+    </style>
+</head>
+<body>
+<div id="container"></div>
+<input id="progress" type="range" name="progress" min="0" max="1" step="0.00001" value="0" />
+
+<script src="js/jquery.min.js"></script>
+<script src="js/Detector.js"></script>
+<script src="js/three.js"></script>
+<script src="js/d3.v4.min.js"></script>
+<script src="js/CanvasRenderer.js"></script>
+<script src="js/OrbitControls.js"></script>
+<script src="js/dat.gui.min.js"></script>
+<script src="js/tween.min.js"></script>
+<script src="js/utils.js"></script>
+<script src="js/DualTriMesh.js"></script>
+
+<script>
+    "use strict";
+
+    var camera, scene, renderer,controlsOrbit,
+        meshA, meshB,
+        materialA, materialB,        
+        group, groupDual,
+        viewManipulate,//
+        controlPairs;//
+
+    var DefaultValue = {
+        sphereRadius : 200,
+        nsep : 5,
+        //
+        fov : 110,
+        lon : 192,
+        lat : 8,
+        //
+        autorot : 0,
+        benchmark : false,
+        useSphereTri : false,
+    };
+    
+
+
+    var ControlPairs = function(){
+
+        var _this = this;
+
+        this.pairs = [];
+
+        this.yellowFrameMaterial = new THREE.MeshBasicMaterial({
+             color: 0xffff00, wireframe: true, side: THREE.DoubleSide, transparent: true });
+
+        this.loadDefaultPairs = function() {
+            $.get('data/54.json', function(data) {
+                _this.loadPairsTxt(data);
+                _this.applyTriangulation();
+            }, 'text');
+        };
+        
+        this.loadPairsTxt = function(text) {
+            _this.pairs = [];
+            var pairs = JSON.parse(text);
+            pairs.forEach(function(pair){
+                var p = new Pair({
+                    loading: true,
+                    x1: pair.x1,
+                    y1: pair.y1,
+                    x2: pair.x2,
+                    y2: pair.y2
+                });
+                if (p.valid === true) {
+                    _this.pairs.push(p);
+                }
+            });
+        };
+
+        function newTriangle(a,b,c) { // a,b,c
+            var geometry = new THREE.Geometry();
+            geometry.vertices.push(a.clone());
+            geometry.vertices.push(b.clone());
+            geometry.vertices.push(c.clone());
+            geometry.faces.push( new THREE.Face3(0,1,2) );
+            geometry.updatePosition = function (a,b,c) {
+                geometry.vertices[0].copy(a);
+                geometry.vertices[1].copy(b);
+                geometry.vertices[2].copy(c);
+                geometry.verticesNeedUpdate = true;
+            };
+            return geometry;
+        }
+
+        function triangleOnSphere(r1,r2,r3,r) {
+            var r = r || 200;
+            var v1 = Util.pos2vec(r1.x1, r1.y1, r);
+            var v2 = Util.pos2vec(r2.x1, r2.y1, r);
+            var v3 = Util.pos2vec(r3.x1, r3.y1, r);
+            var geometry = newTriangle(v1, v2, v3);
+            geometry.vertexNormals = [
+                v1.clone().negate().normalize(),
+                v2.clone().negate().normalize(),
+                v3.clone().negate().normalize()
+            ];
+            geometry.normalsNeedUpdate = true;
+            
+            var face3 = new THREE.Mesh(geometry, _this.yellowFrameMaterial);
+            face3.r1 = r1;
+            face3.r2 = r2;
+            face3.r3 = r3;
+            face3.r = r;
+            face3.triangleAtT = function(t) {
+                var lerp = Util.lerp;
+                var v1 = Util.pos2vec(lerp(face3.r1.x1,face3.r1.x2,t),lerp(face3.r1.y1,face3.r1.y2,t),face3.r);
+                var v2 = Util.pos2vec(lerp(face3.r2.x1,face3.r2.x2,t),lerp(face3.r2.y1,face3.r2.y2,t),face3.r);
+                var v3 = Util.pos2vec(lerp(face3.r3.x1,face3.r3.x2,t),lerp(face3.r3.y1,face3.r3.y2,t),face3.r);
+                return new THREE.Triangle(v1,v2,v3);
+            };
+            face3.holds = [];
+            face3.lerpAndApply = function(t) {
+                var tri = face3.triangleAtT(t);
+                geometry.updatePosition(tri.a, tri.b, tri.c);
+                geometry.vertexNormals[0].copy(tri.a.clone().negate().normalize());
+                geometry.vertexNormals[1].copy(tri.b.clone().negate().normalize());
+                geometry.vertexNormals[2].copy(tri.c.clone().negate().normalize());
+                geometry.normalsNeedUpdate = true;
+            };
+            face3.isTriMesh = true;
+            return face3;
+        }
+
+
+        function dualFace3OnSphere(face3, radius) {
+            var dualTriMesh = new DualTriMesh(DefaultValue.nsep, radius);
+            dualTriMesh.face3 = face3;
+            var uv1  = Util.xy2uv(face3.r1.x1,face3.r1.y1),
+                uv2  = Util.xy2uv(face3.r2.x1,face3.r2.y1),
+                uv3  = Util.xy2uv(face3.r3.x1,face3.r3.y1),
+                uv1p = Util.xy2uv(face3.r1.x2,face3.r1.y2),
+                uv2p = Util.xy2uv(face3.r2.x2,face3.r2.y2),
+                uv3p = Util.xy2uv(face3.r3.x2,face3.r3.y2);
+            dualTriMesh.init(
+                face3.geometry.vertices[0].clone().setLength(dualTriMesh.radius),
+                face3.geometry.vertices[1].clone().setLength(dualTriMesh.radius),
+                face3.geometry.vertices[2].clone().setLength(dualTriMesh.radius),
+                {
+                    uv1: { x: uv1.x, y: uv1.y },
+                    uv2: { x: uv2.x, y: uv2.y },
+                    uv3: { x: uv3.x, y: uv3.y },
+                    material: materialA
+                },
+                {
+                    uv1: { x: uv1p.x, y: uv1p.y },
+                    uv2: { x: uv2p.x, y: uv2p.y },
+                    uv3: { x: uv3p.x, y: uv3p.y },
+                    material: materialB
+                }
+            );
+            dualTriMesh.updatePosition = function() {
+                var v = dualTriMesh.face3.geometry.vertices;
+                if (dualTriMesh.n === DefaultValue.nsep) {
+                    dualTriMesh.update(
+                        v[0].clone().setLength(dualTriMesh.radius),
+                        v[1].clone().setLength(dualTriMesh.radius),
+                        v[2].clone().setLength(dualTriMesh.radius),
+                        DefaultValue.useSphereTri
+                    );
+                } else {
+                    dualTriMesh.init(
+                        v[0].clone().setLength(dualTriMesh.radius),
+                        v[1].clone().setLength(dualTriMesh.radius),
+                        v[2].clone().setLength(dualTriMesh.radius),
+                        {
+                            uv1: { x: uv1.x, y: uv1.y },
+                            uv2: { x: uv2.x, y: uv2.y },
+                            uv3: { x: uv3.x, y: uv3.y },
+                            material: materialA
+                        },
+                        {
+                            uv1: { x: uv1p.x, y: uv1p.y },
+                            uv2: { x: uv2p.x, y: uv2p.y },
+                            uv3: { x: uv3p.x, y: uv3p.y },
+                            material: materialB
+                        },
+                        DefaultValue.nsep,
+                        dualTriMesh.radius,
+                        DefaultValue.useSphereTri
+                    );
+                }
+            };
+            dualTriMesh.updatePosition();
+            return dualTriMesh;
+        }
+
+        this.applyTriangulation = function(){
+            var sites = [];
+            var refs = {};
+            var faces = [];
+            var xmin = 100000000, xmax = 0, ymin = 10000000000, ymax = 0;
+            _this.pairs.forEach(function(pair){
+                if (pair.valid) {
+                    var p = [pair.x1, pair.y1];
+                    refs[Util.pos2name(p[0],p[1])] = pair;
+                    sites.push(p);
+                    if (xmin > p[0]) { xmin = p[0]; }
+                    if (xmax < p[0]) { xmax = p[0]; }
+                    if (ymin > p[1]) { ymin = p[1]; }
+                    if (ymax < p[1]) { ymax = p[1]; }
+                }
+            });
+            var voronoi = d3.voronoi().extent([[xmin-10, ymin-10], [xmax+10, ymax+10]]);
+            var diagram = voronoi(sites);
+            var triangles = diagram.triangles();
+            var index = 0;
+            group.children = [];
+            groupDual.children = [];
+            triangles.forEach(function(tri){
+                var p1 = tri[0];
+                var p2 = tri[1];
+                var p3 = tri[2];
+                var p1n = Util.pos2name(p1[0],p1[1]);
+                var p2n = Util.pos2name(p2[0],p2[1]);
+                var p3n = Util.pos2name(p3[0],p3[1]);
+                var ref1 = refs[p1n];
+                var ref2 = refs[p2n];
+                var ref3 = refs[p3n];
+                if ( ref1 !== undefined && ref2 !== undefined && ref3 !== undefined ) {
+                    var face3 = triangleOnSphere(ref1,ref2,ref3, DefaultValue.sphereRadius);
+                    group.add(face3);
+                    var face3Dual = dualFace3OnSphere(face3, DefaultValue.sphereRadius);
+                    groupDual.add(face3Dual.group);
+                }
+            });
+        };
+    }
+
+
+    var ViewManipulate = function(){
+        var _this = this;
+
+        this.saveScene= function() {
+            var url = renderer.domElement.toDataURL("image/png");
+            window.open(url, '_blank');
+            window.focus();
+        };
+
+
+        this.toggleCamera = function() {
+            controlsOrbit.enabled = !controlsOrbit.enabled;
+            if (controlsOrbit.enabled) {
+                camera.position.copy(camera.position0);
+                controlsOrbit.target.set(0,0,0);
+            } else {
+                camera.position0.copy(camera.position);
+                camera.position.set(0,0,0);
+            }
+        };
+
+
+        this.lastProgress = -1.0;
+        this.progress = 0.0;
+        this.inProgress = false;
+
+        this.applyProgress = function() {
+            $(".close-button").click();
+            _this.inProgress = true;
+            var t1 = new TWEEN.Tween(_this)
+                .delay(100)
+                .to({ progress: 1.0 }, 5000)
+                .onComplete(function() {
+                    _this.inProgress = false;
+                });
+            t1.start();
+        };
+
+        
+        this.morph = function(t) {
+            var t = t || _this.progress;
+            if (t === _this.lastProgress) { return; }
+            _this.lastProgress = t;
+            
+            // if(t >=0.01){
+            // 	 groupDual.visible = true;
+            // }
+            // if(t >=0.99){
+            // 	 groupDual.visible = false;
+            // }
+
+            var value0 =0;
+            if(t <= 0.5){value0 = 2 * t * t}
+            else{value0 = 1-(2 * (1-t) * (1-t))}
+
+            group.children.forEach(function(face3){
+                if (face3.isTriMesh === true && face3.lerpAndApply !== undefined) {
+                    face3.lerpAndApply(value0);
+                }
+            });
+            groupDual.children.forEach(function(face3Dual){
+                face3Dual.dualTriMesh.updatePosition();
+            });
+
+            materialA.opacity = 1-value0;
+            //meshA.material.opacity = 1-value0;            
+            materialB.opacity = value0;
+            //meshB.material.opacity = value0;
+            
+            //materialA.opacity = 1-t;
+            //meshA.material.opacity = 1-t;
+        };
+
+    }
+
+    
+    var animateRender = function(time){
+        window.requestAnimationFrame( animateRender );
+        TWEEN.update();
+        if (DefaultValue.benchmark) {
+            viewManipulate.progress = time%100/100;
+        }
+        viewManipulate.morph();
+        // camera
+        if (controlsOrbit.enabled) {
+            controlsOrbit.update();
+        } else {
+            camera.lon += DefaultValue.autorot/5;
+            if (camera.lon > 360) { camera.lon -= 360; }
+            if (camera.lon <   0) { camera.lon += 360; }
+            camera.lat = Math.max( - 85, Math.min( 85, camera.lat ) );
+            var phi = THREE.Math.degToRad( 90 - camera.lat );
+            var theta = THREE.Math.degToRad( camera.lon );
+            camera.target.x = 500 * Math.sin( phi ) * Math.cos( theta );
+            camera.target.y = 500 * Math.cos( phi );
+            camera.target.z = 500 * Math.sin( phi ) * Math.sin( theta );
+            camera.lookAt( camera.target.add(camera.position) );
+        }
+        // if (viewManipulate.progress === 0 || viewManipulate.progress === 1) {
+        //     group.visible0 = group.visible; group.visible = false;
+        //     groupDual.visible0 = groupDual.visible; groupDual.visible = false;
+        // } else {
+        //     group.visible = group.visible0;
+        //     groupDual.visible = groupDual.visible0;
+        // }
+
+        renderer.render(scene, camera);
+    }
+
+
+    window.addEventListener('load', function() {  
+
+        camera = new THREE.PerspectiveCamera(DefaultValue.fov, window.innerWidth / window.innerHeight, 1, 10000000);
+        camera.position0 = new THREE.Vector3( 1000, 0, 0 );
+        //for User interacte
+        camera.isUserInteracting = false;
+        camera.lon = DefaultValue.lon;
+        camera.lat = DefaultValue.lat;
+        camera.onPointerDownPointerX = 0;
+        camera.onPointerDownPointerY = 0;
+        camera.onPointerDownLon = 0;
+        camera.onPointerDownLat = 0;
+        camera.target = new THREE.Vector3( 0, 0, 0 );
+        
+        scene = new THREE.Scene();
+        var light = new THREE.PointLight( 0xff0000, 1, 100 );
+		light.position.set( 0, 0, 0 );
+		scene.add( light );
+
+        scene.add(new THREE.AxisHelper(1000));
+
+        group = new THREE.Group();
+        group.visible = false;
+        scene.add(group);// 黄色格子
+
+        groupDual = new THREE.Group();
+        scene.add(groupDual); //两个纹理
+
+        
+        materialA = new THREE.MeshBasicMaterial( { map: new THREE.TextureLoader().load( 'data/5.jpg' ), transparent: true } );
+        materialB = new THREE.MeshBasicMaterial( { map: new THREE.TextureLoader().load( 'data/4.jpg' ), transparent: false } );
+        materialA.side = materialB.side = THREE.DoubleSide;
+
+        // var geometryA = new THREE.SphereGeometry( 500, 64, 32 ); geometryA.scale( - 1, 1, 1 );
+        // var geometryB = new THREE.SphereGeometry( 600, 64, 32 ); geometryB.scale( - 1, 1, 1 );
+        // meshA = new THREE.Mesh( geometryA, materialA.clone() );
+        // meshB = new THREE.Mesh( geometryB, materialB.clone() );
+        //scene.add( meshA ); // 外面的全景
+        //scene.add( meshB );
+        
+
+        
+        if( Detector.webgl ){
+            renderer = new THREE.WebGLRenderer({
+                antialias: true
+            });
+        } else {
+            renderer = new THREE.CanvasRenderer();
+        }
+        renderer.setPixelRatio( window.devicePixelRatio );
+        //renderer.setSize(window.innerWidth, window.innerHeight);
+        renderer.setSize(1280, 720);
+        renderer.domElement.style.position = 'absolute';
+        renderer.domElement.style.top = 0;
+        
+        controlsOrbit = new THREE.OrbitControls( camera, renderer.domElement );
+        controlsOrbit.enabled = false;
+
+
+        // GUI 1
+        var container = document.getElementById( 'container' );
+        container.appendChild(renderer.domElement);
+        container.addEventListener( 'mousedown', function(event) {
+            if (controlsOrbit.enabled) { return; }
+            camera.isUserInteracting = true;
+            camera.onPointerDownPointerX = event.clientX;
+            camera.onPointerDownPointerY = event.clientY;
+            camera.onPointerDownLon = camera.lon;
+            camera.onPointerDownLat = camera.lat;
+        }, false );
+        container.addEventListener( 'mousemove', function(event) {
+            if (controlsOrbit.enabled) { return; }
+            if ( camera.isUserInteracting === true ) {
+                camera.lon = ( camera.onPointerDownPointerX - event.clientX ) * 0.1 + camera.onPointerDownLon;
+                camera.lat = ( event.clientY - camera.onPointerDownPointerY ) * 0.1 + camera.onPointerDownLat;
+            }
+        }, false );
+        container.addEventListener( 'mouseup', function(event) {
+            if (controlsOrbit.enabled) { return; }
+            camera.isUserInteracting = false;
+        }, false );
+        container.addEventListener( 'wheel', function(event) {
+            var fov = camera.fov + event.deltaY * 0.05;
+            camera.fov = THREE.Math.clamp(Math.round(fov), 10, 110);
+            camera.updateProjectionMatrix();
+        }, false );
+
+
+        // GUI 2
+        viewManipulate = new ViewManipulate();
+        var gui = new dat.GUI(); 
+        gui.closed = true;
+        gui.add(viewManipulate, 'saveScene').name("截图");
+        gui.add(viewManipulate, 'toggleCamera').name("切换相机");
+
+        gui.add(DefaultValue, 'autorot').min(-5).max(+5).step(1).listen().name("自动浏览");
+        gui.add(DefaultValue, 'useSphereTri').name("精细三角面片");
+        gui.add(DefaultValue, 'benchmark').name("压力测试");
+
+        gui.add(camera, 'fov').min(10).max(150).step(1).listen().name("视场角").onChange(function(value){
+            camera.fov = value;
+            camera.updateProjectionMatrix();
+        });
+        gui.add(camera, 'lon').min(  0).max(360).step(1).listen().name("lon");
+        gui.add(camera, 'lat').min(-85).max( 85).step(1).listen().name("lat");
+
+        gui.add(viewManipulate, 'applyProgress').name("过渡");        
+        gui.add(viewManipulate, 'progress').min(0.0).max(1.0).step(0.01).listen();
+
+        var vis = gui.addFolder('可见性设置');
+        vis.add(group, 'visible').name("黄色格网");
+        vis.add(groupDual, 'visible').name("覆盖面");
+
+        var advanced = gui.addFolder('高级设置');
+        advanced.add(DefaultValue, 'nsep').min(2).max(25).step(1).listen().name("face #sep").onChange(function(){
+            viewManipulate.lastProgress = -1.0;
+        });
+
+        var link = {
+            "README": function() { window.location = "README.html"; },
+            "dyna_texture": function() { window.location = "dyna_texture.html"; }
+        };
+        var links = gui.addFolder('链接');
+        links.add(link, 'dyna_texture').name("动态全景图方案");
+        links.add(link, 'README').name("文档");
+        // gui.add(viewManipulate, 'loadDefaultPairs').name("生成格网");
+        // gui.add(viewManipulate, 'applyTriangulation').name("Apply");
+        // var ref = gui.addFolder('更多示例');
+
+
+        animateRender();
+
+        controlPairs = new ControlPairs();
+        controlPairs.loadDefaultPairs();
+
+    }, false);
+
+
+</script>
+
+</body>
+</html>
