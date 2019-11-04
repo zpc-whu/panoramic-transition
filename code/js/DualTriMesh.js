@@ -1,3 +1,4 @@
+
 var Pair = function(options) {
     var options = options || {};
     var x1, y1, u1, v1;
@@ -226,6 +227,7 @@ var DualTriMesh = function(n, radius, useVertexNormals) {
         _this.triMesh1.update(a,b,c,useAxisAngle);
         _this.triMesh2.update(a,b,c,useAxisAngle);
     };
+    
     this.init = function(a,b,c, config1, config2, n, radius, useAxisAngle) {
         if (n !== undefined) { _this.n = n; }
         if (radius !== undefined) { _this.radius = radius; }
